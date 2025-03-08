@@ -1,11 +1,11 @@
 # Cancer Biomarker Discovery Platform
 
 ## Overview
-Our bioinformatics pipeline analyzes single-cell RNA sequencing (scRNA-seq) data to identify therapeutic targets and biomarkers in cancer treatment. We specialize in characterizing tumor heterogeneity and treatment response patterns at single-cell resolution.
+This repository contains an example analysis of multiple scRNA-Seq datasets to identify cancer biomarkers, infer mechanistic relationships, and develop a platform that could lead to prognostic evaluation. The client was a startup company we worked with that ended up raising a seed round.
 
-This repository contains an example analysis from a startup company we worked with that ended up raising a seed round.
+This bioinformatics pipeline analyzes single-cell RNA sequencing (scRNA-seq) data to identify therapeutic targets and biomarkers in cancer treatment. We specialize in characterizing tumor heterogeneity and treatment response patterns at single-cell resolution.
 
-## Key Features
+## Research Objectives and Pipeline Description
 
 ### 🔬 Advanced Analytics
 - **Single-cell Resolution**: Map gene expression patterns in individual cells
@@ -14,16 +14,16 @@ This repository contains an example analysis from a startup company we worked wi
 - **Immune Cell Profiling**: Analyze immune cell populations and their states in depth
 
 ### 📊 Robust Data Integration
-- We integrate multiple scRNA-seq datasets seamlessly
-- We correct batch effects using the Harmony algorithm
-- We implement rigorous quality control and normalization
-- We standardize all data processing steps
+- We integrated multiple scRNA-seq datasets seamlessly
+- We corrected batch effects using the Harmony algorithm
+- We implemented rigorous quality control and normalization
+- We standardized all data processing steps
 
 ### 🎯 Therapeutic Target Discovery
-- We analyze differential expression across multiple cell populations
-- We identify cell-type specific markers
-- We perform pathway enrichment analysis
-- We classify cell types using machine learning
+- We analyzed differential expression across multiple cell populations
+- We identified cell-type specific markers
+- We performed pathway enrichment analysis
+- We classified cell types using machine learning
 
 ## Business Value
 
@@ -43,30 +43,30 @@ This repository contains an example analysis from a startup company we worked wi
 
 ### Analysis Pipeline
 1. Data Quality Control & Integration
-   - We automate QC metrics
-   - We integrate multiple datasets
-   - We eliminate batch effects
+   - We automated QC metrics
+   - We integrated multiple datasets
+   - We eliminated batch effects
 
 2. Cell Population Analysis
-   - We cluster cells without supervision
-   - We identify cell types
-   - We analyze cell trajectories
+   - We clustered cells without supervision
+   - We identified cell types
+   - We analyzed cell trajectories
 
 3. Differential Expression
-   - We employ multiple comparison methods
-   - We ensure statistical rigor
-   - We analyze pathways
+   - We employed multiple comparison methods
+   - We ensured statistical rigor
+   - We analyzed pathways
 
 4. Machine Learning
-   - We classify using Random Forests
-   - We build predictive models
-   - We rank feature importance
+   - We classified using Random Forests
+   - We built predictive models
+   - We ranked feature importance
 
-### Visualization
-- We create interactive UMAP plots
-- We generate customizable heatmaps
-- We produce publication-ready figures
-- We deliver comprehensive reports
+### Data Visualization
+- We created interactive UMAP plots
+- We generated customizable heatmaps
+- We produced publication-ready figures (not attached)
+- We delivered comprehensive reports (not attached)
 
 ## Getting Started
 
