@@ -3,6 +3,8 @@
 ## Overview
 Our bioinformatics pipeline analyzes single-cell RNA sequencing (scRNA-seq) data to identify therapeutic targets and biomarkers in cancer treatment. We specialize in characterizing tumor heterogeneity and treatment response patterns at single-cell resolution.
 
+This repository contains an example analysis from a startup company we worked with that ended up raising a seed round.
+
 ## Key Features
 
 ### 🔬 Advanced Analytics
