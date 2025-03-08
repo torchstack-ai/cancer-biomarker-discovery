@@ -1,0 +1,138 @@
+---
+title: "Gene set enrichment analysis"
+date: "Last modified: `r format(Sys.time(), '%B %d, %Y')`"
+tags: [scRNA-seq, seurat, melanoma, immunotherapy, PBMCs] 
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: true
+    number_sections: false
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    self_contained: yes
+---
+
+# Notebook Description
+
+This notebook compiles the code and outputs for gene set enrichment analysis (GSEA) for the set of differentially expressed genes (DEGs) previously identified with the DE analysis. GSEA is performed using [enrichR](https://cran.r-project.org/web/packages/enrichR/vignettes/enrichR.html). 
+
+Of note, we use the set of DEGs identified using the [MAST](https://bioconductor.org/packages/release/bioc/html/MAST.html) method.  
+
+# Initialize environment
+
+Install required packages.
+
+```{r install_packages, results='hide', message=F, warning=F, error=F}
+
+# Define packages to install
+pkg.list = c('svDialogs', 'dplyr', 'openxlsx', 'enrichR', 'UpSetR')
+
+# Define packages not already installed
+pkg.install <- pkg.list[!(pkg.list %in% installed.packages()[, 'Package'])]
+
+# Install uninstalled packages
+if (length(pkg.install) > 0) {
+  install.packages(pkg.install)
+}
+
+```
+
+Load installed packages.  
+
+```{r load_packages, results="hide", message=F, warning=F, error=F}
+
+# Load packages
+library(svDialogs)    # for prompting user-input
+library(dplyr)        # for data processing
+library(openxlsx)     # to write data to excel
+library(enrichR)      # to perform GSEA
+library(UpSetR)       # to visualize multiple set comparisons
+
+```
+
+Load pre-processed data. 
+
+```{r load_data, warning=F, message=F}
+
+# Load saved DE data
+de <- list()
+de$ttest <- import_list('results/DE_ttest.xlsx')
+de$mast <- import_list('results/DE_mast.xlsx')
+
+```
+
+# GSEA analyses
+
+**Description**: determine pathways enriched by a given set of differentially expressed genes (DEGs).  
+
+Total runtime: ~2 minutes.  
+
+```{r GSEA_analysis, warning=F, message=T}
+
+# Start timer
+t.start <- Sys.time()
+
+# Instantiate GSEA variable
+gsea <- list()
+
+# Ensure comparison to human genes
+setEnrichrSite('Enrichr')
+
+# Select databases to inquire
+dbs <- dlg_list(sort(listEnrichrDbs()$libraryName), multiple=T)$res
+
+# Loop through all DE fields
+f <- names(de$mast)
+for (i in 1:length(f)) {
+  x <- de$mast[[f[i]]]
+  y <- enrichr(x$gene[x$p_val_adj < 0.05], dbs)
+  z <- y$GO_Biological_Process_2021
+  n <- sum(z$Adjusted.P.value < 0.05)
+  gsea[[f[i]]] <- z[z$Adjusted.P.value < 0.05, ]
+  cat(sprintf('No. of enriched pathways for %s: %d\n', f[i], n))
+  plotEnrich(z, orderBy='Adjusted.P.value') + 
+    ggtitle(sprintf('Case: %s (Total = %d)', f[i], n))
+  ggsave(paste0('plots/GSEA_', f[i], '.pdf'), width=7, height=5, units='in')
+}
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+t.end - t.start
+
+```
+
+Visualize intersecting pathways between comparisons.  
+
+```{r GSEA_intersect, warning=F, message=T}
+
+# Define plots data
+df <- list('tumor'=gsea$tumor$Term, 
+           'immune'=gsea$immune$Term, 
+           'B'=gsea$B$Term, 
+           'CD8'=gsea$CD8$Term, 
+           'Macrophage'=gsea$Macrophage$Term, 
+           'Memory'=gsea$Memory$Term, 
+           'Activated T'=gsea$Activated$Term, 
+           'response'=gsea$response$Term)
+
+# Generate and save UpSet plot
+pdf(file='plots/GSEA_intersect.pdf', width=11, height=8)
+upset(fromList(df), sets=names(df), order.by='freq')
+
+```
+
+# Save results (if prompted)
+
+```{r save_outputs, warning=F, message=T}
+
+save.data <- dlgInput('Save all results? (T/F)', F)$res %>% as.logical(.)
+if (save.data) { 
+  # GSEA results
+  write.xlsx(gsea, 'results/GSEA.xlsx', row.names=F)
+}
+
+```

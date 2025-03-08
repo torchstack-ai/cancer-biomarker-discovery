@@ -1,0 +1,183 @@
+---
+title: "ML modeling of scRNA-seq data"
+date: "Last modified: `r format(Sys.time(), '%B %d, %Y')`"
+tags: [scRNA-seq, seurat, melanoma, immunotherapy, PBMCs] 
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: true
+    number_sections: false
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    self_contained: yes
+---
+
+# Notebook Description
+
+This notebook compiles the code and outputs for ML application onto the scRNA-seq data on melanoma and immunotherapy. Here we specifically construct a Random Forest classifier using an scRNA-seq method called [SingleCellNet](https://github.com/pcahan1/singleCellNet).  
+
+# Initialize environment
+
+Install required packages.
+
+```{r install_packages}
+
+# Define packages to install
+pkg.list = c('svDialogs', 'dplyr', 'Seurat', 'ggplot2', 'singleCellNet')
+
+# Define packages not already installed
+pkg.install <- pkg.list[!(pkg.list %in% installed.packages()[, 'Package'])]
+
+# Install SingleCellNet (SCN)
+if ('singleCellNet' %in% pkg.install) {
+  install.packages("devtools")
+  devtools::install_github("pcahan1/singleCellNet")
+  pkg.install <- pkg.install[!('singleCellNet' %in% pkg.install)]
+}
+
+# Install uninstalled packages
+if (length(pkg.install) > 0) {
+  install.packages(pkg.install)
+}
+
+```
+
+Load installed packages.  
+
+```{r load_packages, results="hide", message=F, warning=F, error=F}
+
+# Load packages
+library(svDialogs)     # for prompting user-input
+library(dplyr)         # for data processing
+library(Seurat)        # to use Seurat functions
+library(ggplot2)       # for data visualization
+library(singleCellNet) # for RF implementation
+
+```
+
+Additional settings.  
+
+```{r settings}
+
+# Adjust system settings
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 2)
+
+# Save plots? (default: F)
+save.plots <- dlgInput('Save all outputs? (T/F)', F)$res
+
+# Set seed
+set.seed(123)
+
+```
+
+# ML modeling
+
+**Description**: construct, train, and evaluate the four models described above.    
+
+Total runtime: ~2 minutes.  
+
+Load data
+
+```{r load_data, warning=F, message=T}
+
+# Load data
+f <- list.files()
+if (any(endsWith(f, '.RData'))) {
+  load(f[endsWith(f, '.RData')][1])
+}
+
+# Remove unnecessary variables
+rm(d, de, obj, p, p.data, xl.list, x, y, dot.feat, f, immune.cells, ix, jx1, jx2, 
+   lab, ridge.feat, save.data, save.outputs, save.wksp, de_analyze, qc_filter)
+gc()
+
+```
+
+Define training + testing data. 
+
+```{r train_test, warning=F, message=T}
+
+# Pull required data
+s <- extractSeurat(data.all$proc, exp_slot_name='counts')
+rm(data.all); gc()
+st <- s$sampTab %>% mutate(ID=rownames(.))
+exp <- s$expDat %>% as(., 'dgCMatrix')
+
+# Define label field
+label <- dlg_list(title='Choose label: ', sort(colnames(st)), multiple=F)$res
+ID <- dlg_list(title='Choose cell ID: ', sort(colnames(st)), multiple=F)$res
+
+# Re-order by label field
+ix <- order(st[[label]])
+st <- st[ix, ]
+exp <- exp[, ix]
+
+# Train/Test split
+stList1 <- splitCommon(sampTab=st, ncells=100, dLevel=label)
+stTrain <- stList1[[1]]
+expTrain <- exp[, rownames(stTrain)]
+stList2 <- splitCommon(sampTab=stList1[[2]], ncells=100, dLevel=label)
+stTest <- stList2[[1]]
+expTest <- exp[, rownames(stTest)]
+
+```
+
+Apply SCN (runtime: ~5 minutes). 
+
+```{r SCN, warning=F, message=T}
+
+# Start timer
+t.start <- Sys.time()
+
+# Train model
+x <- scn_train(stTrain=stTrain, expTrain=expTrain, nTopGenes=10, nRand=70, 
+               nTrees=1000, nTopGenePairs=25, dLevel=label)
+
+# Test model
+y <- scn_predict(cnProc=x[['cnProc']], expDat=expTest, nrand=50)
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+t.end - t.start
+
+```
+
+Assessment + visualization.  
+
+```{r evaluation, warning=F, message=F}
+
+# Assess model
+z <- assess_comm(ct_scores=y, stTrain=stTrain, stQuery=stTest, dLevelSID=ID,
+                 classTrain=label, classQuery=label)
+plot_PRs(z) + ggtitle('Model performance (test set)')
+if (save.plots) {
+  ggsave('plots/ML_performance.pdf', width=5, height=5, units='in')
+}
+
+# Visualize results
+#   classification results
+nrand <- 50
+sla <- as.vector(stTest[[label]])
+names(sla) <- as.vector(rownames(stTest))
+slaRand <- rep('rand', nrand)
+names(slaRand) <- paste('rand_', 1:nrand, sep='')
+sla <- append(sla, slaRand)
+p <- sc_hmClass(classMat=y, grps=sla, max=300, isBig=T)
+if (save.plots) {
+  pdf('plots/ML_classification.pdf', width=7, height=5,
+      title='Classification results (test set)')
+  p
+}
+#   attribution plot
+plot_attr(classRes=y, sampTab=stTest, nrand=nrand, sid=ID, dLevel=label) + 
+  xlab('Predicted group') + ylab('True class ratio') + 
+  ggtitle('Attribution plot (test set)')
+if (save.plots) {
+  ggsave('plots/ML_attribution.pdf', width=7, height=5, units='in')
+}
+
+```

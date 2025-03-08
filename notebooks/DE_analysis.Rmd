@@ -1,0 +1,1307 @@
+---
+title: "DE Analysis of scRNA-seq data"
+date: "Last modified: `r format(Sys.time(), '%B %d, %Y')`"
+tags: [scRNA-seq, seurat, melanoma, immunotherapy, PBMCs] 
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: true
+    number_sections: false
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    self_contained: yes
+---
+
+# Notebook Description
+
+This notebook compiles the code and outputs for differential expression (DE) analysis. Specifically, two methods are covered:  
+  * unpaired Student's t-test (custom function) 
+  * [MAST](https://doi.org/10.1186/s13059-015-0844-5) 
+
+Of note, pre-processed data stored in the `scRNAseq_analysis.RData` file is used for the analyses detailed below.  
+
+# Initialize environment
+
+```{r load_packages, results="hide", message=F, warning=F, error=F}
+# Memory management settings
+options(future.globals.maxSize = 16000 * 1024^2)  # Set maximum global size to 8GB
+
+# Load core packages first
+library(Matrix)       # for sparse matrix operations
+library(Seurat)      # for scRNA-seq analysis
+library(MAST)        # for scRNAseq DEG analysis
+
+# Load other packages
+library(svDialogs)    # for prompting user-input
+library(vroom)        # for quickly reading data
+library(dplyr)        # for data processing
+library(DT)           # to display datatables
+library(harmony)      # to integration scRNA-seq data
+library(patchwork)    # for combining plots
+library(ggplot2)      # for data visualization
+library(ggrepel)      # to use geom_pont_repel()
+library(ggvenn)       # to visualize venn diagrams
+library(openxlsx)     # to write data to excel
+library(progress)     # to display progress bar
+library(rio)          # to load all worksheets in a workbook
+library(pheatmap)     # to visualize heatmaps
+library(ggfortify)    # to visualize PCA plots
+library(presto)       # for faster Wilcoxon test implementation
+library(gridExtra)    # for arranging multiple plots
+
+# Set up parallel processing
+library(future)
+plan(multisession, workers = 2)  # Adjust based on available memory
+options(future.globals.maxSize = 16000 * 1024^2)
+```
+
+System settings.  
+
+```{r settings}
+
+# Adjust system settings
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 2)
+
+# Enhanced memory management functions
+clear_memory <- function(deep_clean = FALSE) {
+  # Standard cleanup
+  gc(verbose = FALSE)
+  if(exists(".Random.seed")) rm(.Random.seed)
+  
+  # Deep cleanup if requested
+  if(deep_clean) {
+    # Clear package caches
+    if(exists(".__C__")) rm(list=".__C__", envir=.GlobalEnv)
+    # Clear hidden objects
+    rm(list = ls(all.names = TRUE, envir = .GlobalEnv), envir = .GlobalEnv)
+    # Force garbage collection multiple times
+    replicate(3, gc(verbose = FALSE))
+  }
+  
+  invisible(gc())
+}
+
+# Function to get data efficiently with batching support
+get_assay_data <- function(object, data_type = "data", batch_size = 1000) {
+  tryCatch({
+    # Get data using appropriate method
+    if (packageVersion("Seurat") >= "5.0.0") {
+      data <- GetAssayData(object = object, layer = data_type)
+    } else {
+      data <- GetAssayData(object = object, slot = data_type)
+    }
+    
+    # Convert to sparse matrix if dense
+    if (!is(data, "dgCMatrix")) {
+      data <- as(data, "dgCMatrix")
+    }
+    
+    return(data)
+  }, error = function(e) {
+    stop(sprintf("Failed to get assay data: %s", e$message))
+  })
+}
+
+# Function to process data in batches
+process_in_batches <- function(data, batch_size = 1000, FUN, ...) {
+  n_cells <- ncol(data)
+  n_batches <- ceiling(n_cells / batch_size)
+  results <- vector("list", n_batches)
+  
+  pb <- progress_bar$new(total = n_batches)
+  
+  for(i in 1:n_batches) {
+    start_idx <- (i-1) * batch_size + 1
+    end_idx <- min(i * batch_size, n_cells)
+    
+    # Process batch
+    batch_data <- data[, start_idx:end_idx]
+    results[[i]] <- FUN(batch_data, ...)
+    
+    # Clean up
+    rm(batch_data)
+    clear_memory()
+    pb$tick()
+  }
+  
+  # Combine results
+  combined_results <- do.call(rbind, results)
+  rm(results)
+  clear_memory()
+  
+  return(combined_results)
+}
+
+# Add gene anonymization function after the settings chunk
+anonymize_genes <- function(gene_list, prefix = "GENE") {
+  # Create mapping of real genes to anonymous IDs
+  anon_ids <- paste0(prefix, "_", sprintf("%04d", seq_along(gene_list)))
+  names(anon_ids) <- gene_list
+  return(anon_ids)
+}
+
+```
+
+Load pre-processed data. 
+
+```{r load_data, warning=F, message=F}
+file_path <- "/Users/scampit/Projects/torchstack/cancer-biomarker-discovery"
+setwd(file_path)
+
+# Start with clean environment
+#clear_memory(deep_clean = TRUE)
+
+# Load data from saved workspace
+f <- list.files()
+if (any(endsWith(f, '.RData'))) {
+  load(f[endsWith(f, '.RData')][1])
+} else {
+  stop("No .RData file found. Please ensure scRNAseq_wksp.RData is in the working directory.")
+}
+
+# Initialize DE lists
+de <- list()
+
+# Get data from Seurat object efficiently
+tryCatch({
+  message("Loading expression data from Seurat object...")
+  de$data <- get_assay_data(data.all$proc)
+  
+  # Verify data loaded correctly
+  if (is.null(de$data) || !is(de$data, "dgCMatrix")) {
+    stop("Failed to load expression data properly")
+  }
+  message(sprintf("Loaded expression matrix with %d genes and %d cells", 
+                 nrow(de$data), ncol(de$data)))
+}, error = function(e) {
+  stop(sprintf("Error loading data: %s", e$message))
+})
+
+#clear_memory()
+
+# Load or initialize results
+de$ttest <- if(file.exists('results/tables/DE_ttest.xlsx')) {
+  import_list('results/tables/DE_ttest.xlsx')
+} else {
+  list()
+}
+
+de$mast <- if(file.exists('results/tables/DE_mast.xlsx')) {
+  import_list('results/tables/DE_mast.xlsx')
+} else {
+  list()
+}
+
+#clear_memory(deep_clean = TRUE)
+
+# Verify data structure
+str(de, max.level = 1)
+
+```
+
+```{r summary_stats, warning=F, message=F}
+
+# Assign row names to MAST results
+f <- names(de$ttest)
+for (i in 1:length(f)) { 
+  x <- de$ttest[[f[i]]]; y <- de$mast[[f[i]]]
+  g <- intersect(x$gene[x$q.val < 0.05], y$gene[y$p_val_adj < 0.05]) 
+  cat(sprintf('%s\tDEGs (t-test): %d\tDEGs (MAST): %d\tDEGs (overlap): %d\n', 
+              f[i], sum(x$q.val < 0.05), sum(y$p_val_adj < 0.05), length(g)))
+}
+
+```
+
+# DE analyses
+
+**Description**: determine differentially expressed genes (DEGs) between different comparisons.  
+
+```{r DE_initialize, warning=F, message=T, eval=!('data' %in% de)}
+
+# Instantiate DE variable + relevant fields
+de <- list(); de$ttest <- list(); de$mast <- list()
+
+# Define data to work with - update to use layer
+tryCatch({
+  de$data <- GetAssayData(object=data.all$proc, layer='data')
+}, error = function(e) {
+  # Fallback for older Seurat versions
+  message("Attempting fallback for older Seurat version...")
+  de$data <- GetAssayData(object=data.all$proc, slot='data')
+})
+
+# Add validation
+if (is.null(de$data) || ncol(de$data) == 0 || nrow(de$data) == 0) {
+  stop("Failed to retrieve data from Seurat object")
+}
+
+```
+
+## Case: disease vs. control (tumor)
+
+Comparison between benign vs. tumor skin cells. 
+Estimated runtime: ~15 minutes. 
+
+```{r DE_tumor, warning=F, message=T, eval=!('tumor' %in% de$ttest)}
+
+# Start timer
+t.start <- Sys.time()
+
+# Define cell groups to compare
+ix <- intersect(rownames(obj$GSE72056), rownames(obj$GSE115978)) %>%
+  intersect(., rownames(obj$GSE151091))
+jx1 <- data.all$proc$Source == names(obj)[3] | data.all$proc$Malignant %in% 'Yes'
+jx2 <- data.all$proc$Source == names(obj)[4]
+
+# Subsample cells if too many
+max_cells_per_group <- 1000
+if(sum(jx1) > max_cells_per_group) {
+  set.seed(42)
+  cells_g1 <- sample(which(jx1), max_cells_per_group)
+  jx1[setdiff(which(jx1), cells_g1)] <- FALSE
+}
+if(sum(jx2) > max_cells_per_group) {
+  set.seed(42)
+  cells_g2 <- sample(which(jx2), max_cells_per_group)
+  jx2[setdiff(which(jx2), cells_g2)] <- FALSE
+}
+
+# DE analysis (t-test) with memory management
+x <- de$data[ix, jx1]
+y <- de$data[ix, jx2]
+#clear_memory()
+
+de$ttest$tumor <- de_analyze(x, y) %>% na.omit
+rm(x, y)
+#clear_memory(deep_clean = TRUE)
+
+# DE analysis (MAST)
+message("Creating Seurat object...")
+combined_data <- cbind(de$data[ix, jx1], de$data[ix, jx2])
+if (!is(combined_data, "dgCMatrix")) {
+  combined_data <- as(combined_data, "dgCMatrix")
+}
+x <- CreateSeuratObject(counts = combined_data)
+rm(combined_data)
+#clear_memory()
+
+# Process data in steps with memory management
+message("Normalizing data...")
+x <- NormalizeData(x, verbose = FALSE)
+#clear_memory()
+
+message("Finding variable features...")
+x <- FindVariableFeatures(x, verbose = FALSE)
+#clear_memory()
+
+message("Scaling data...")
+x <- ScaleData(x, verbose = FALSE)
+#clear_memory()
+
+message("Running PCA...")
+x <- RunPCA(x, verbose = FALSE)
+#clear_memory()
+
+# Set identities
+cells_g1 <- 1:sum(jx1)
+cells_g2 <- (sum(jx1) + 1):ncol(x)
+Idents(object = x, cells = cells_g1) <- 'Disease'
+Idents(object = x, cells = cells_g2) <- 'Control'
+rm(cells_g1, cells_g2)
+#clear_memory()
+
+# Run MAST analysis with error handling and memory management
+message("Running differential expression analysis...")
+tryCatch({
+  de$mast$tumor <- FindMarkers(
+    object = x,
+    ident.1 = 'Disease',
+    ident.2 = 'Control',
+    test.use = 'MAST',
+    verbose = TRUE,
+    max.cells.per.ident = 1000,
+    min.pct = 0.1,        # Filter low-expressed genes
+    logfc.threshold = 0.25 # Filter low effect size
+  )
+}, error = function(e) {
+  message("Error in MAST analysis: ", e$message)
+  message("Attempting alternative analysis method...")
+  de$mast$tumor <- FindMarkers(
+    object = x,
+    ident.1 = 'Disease',
+    ident.2 = 'Control',
+    test.use = 'wilcox',
+    verbose = TRUE,
+    max.cells.per.ident = 1000,
+    min.pct = 0.1,
+    logfc.threshold = 0.25
+  )
+})
+
+# Clean up
+rm(x)
+#clear_memory(deep_clean = TRUE)
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+message("Analysis completed in: ", difftime(t.end, t.start, units = "mins"), " minutes")
+
+```
+
+## Case: disease vs. control (immune cells, bulk)
+
+Bulk comparison between healthy vs. diseased immune cells. 
+Estimated runtime: ~20 minutes. 
+
+```{r DE_immune_bulk,warning=F, message=T, eval=!('immune' %in% de$ttest)}
+
+# Start timer
+t.start <- Sys.time()
+
+# Define cell groups to compare
+ix <- intersect(rownames(obj$GSE120575), rownames(obj$GSE115978)) %>% 
+  intersect(., rownames(obj$GSE183212))
+jx1 <- data.all$proc$Source == names(obj)[1] | data.all$proc$Malignant %in% 'No'
+jx2 <- data.all$proc$Source == names(obj)[5]
+
+# DE analysis (t-test)
+x <- de$data[ix, jx1]; y <- de$data[ix, jx2]
+de$ttest$immune <- de_analyze(x, y) %>% na.omit()
+
+# DE analysis (MAST)
+# Create Seurat object with proper assay
+x <- CreateSeuratObject(counts = cbind(de$data[ix, jx1], de$data[ix, jx2]))
+# Normalize the data
+x <- NormalizeData(x)
+# Find variable features
+x <- FindVariableFeatures(x)
+# Scale the data
+x <- ScaleData(x)
+# Run PCA
+x <- RunPCA(x)
+
+# Set identities
+Idents(object=x, cells=1:sum(jx1)) <- 'Tumor'
+Idents(object=x, cells=sum(jx1)+1:ncol(x)) <- 'Benign'
+
+# Run MAST analysis
+de$mast$immune <- FindMarkers(object=x, 
+                             ident.1='Tumor', 
+                             ident.2='Benign', 
+                             test.use='MAST',
+                             verbose = TRUE)
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+t.end - t.start
+
+```
+
+## Case: disease vs. control (immune cells, cluster-based)
+
+Immune cell-specific comparisons between healthy vs. diseased cells. 
+Estimated runtime: ~15 minutes. 
+
+```{r DE_immune_cluster, warning=F, message=T}
+# Start timer
+t.start <- Sys.time()
+
+# Define labeled scRNAseq data
+lab <- c('Tumor cell', 'Technical error 1', 'Cytotoxic CD8 T cell 1', 'B cell', 
+         'Melanocytes 1', 'Macrophage', 'Cytotoxic CD8 T cell 2', 'Technical error 2', 
+         'Memory T cell', 'Melanocytes 2', 'Dysfunctional CD8 T cell', 
+         'Cytotoxic CD8 T cell 3', '? 1', 'Melanocytes 3', 'Activated cell', 
+         'Exhausted T cell', 'Cytotoxic T cell', '? 2', '? 3', 'Melanocytes 4', '? 4')
+names(lab) <- levels(data.all$proc)
+plot.data <- data.all$proc %>% RenameIdents(., lab)
+
+# Make sure we have the expression data
+if (!exists("de") || is.null(de$data) || !is(de$data, "dgCMatrix")) {
+  message("Reloading expression data...")
+  de <- list()
+  de$data <- GetAssayData(object = data.all$proc, layer = "data")
+  if (!is(de$data, "dgCMatrix")) {
+    de$data <- as(de$data, "dgCMatrix")
+  }
+}
+
+# Initialize results lists if they don't exist
+if (!"ttest" %in% names(de)) de$ttest <- list()
+if (!"mast" %in% names(de)) de$mast <- list()
+
+# Iterate through each immune cell group
+immune.cells <- c('B', 'CD8', 'Macrophage', 'Memory', 'Activated')
+for (i in 1:length(immune.cells)) { 
+  message(sprintf("\nProcessing %s cells...", immune.cells[i]))
+  
+  # Define row + column indices
+  ix <- intersect(rownames(obj$GSE120575), rownames(obj$GSE115978)) %>% 
+    intersect(., rownames(obj$GSE183212))
+  c <- grepl(immune.cells[i], Idents(plot.data))
+  jx1 <- (plot.data$Source == names(obj)[1] | 
+            data.all$proc$Malignant %in% 'No') & c
+  jx2 <- data.all$proc$Source == names(obj)[5] & c
+  
+  # Print number of genes + cells
+  message(sprintf('No. of genes: %d\tNo. of G1: %d\tNo. of G2: %d', 
+                length(ix), sum(jx1), sum(jx2)))
+  
+  # Skip if not enough cells
+  if (sum(jx1) < 3 || sum(jx2) < 3) {
+    message(sprintf("Skipping %s - insufficient cells", immune.cells[i]))
+    next
+  }
+  
+  # DE analysis (t-test)
+  message("Running t-test analysis...")
+  x <- de$data[ix, jx1]
+  y <- de$data[ix, jx2]
+  de$ttest[[immune.cells[i]]] <- de_analyze(x, y) %>% na.omit()
+  rm(x, y)
+  clear_memory()
+
+  # DE analysis (MAST)
+  message("Running MAST analysis...")
+  tryCatch({
+    # Create Seurat object
+    combined_data <- cbind(de$data[ix, jx1], de$data[ix, jx2])
+    if (!is(combined_data, "dgCMatrix")) {
+      combined_data <- as(combined_data, "dgCMatrix")
+    }
+    x <- CreateSeuratObject(counts = combined_data)
+    rm(combined_data)
+    clear_memory()
+    
+    # Process data
+    x <- x %>%
+      NormalizeData(verbose = FALSE) %>%
+      FindVariableFeatures(verbose = FALSE) %>%
+      ScaleData(verbose = FALSE)
+    
+    # Set identities
+    Idents(object = x, cells = 1:sum(jx1)) <- 'Tumor'
+    Idents(object = x, cells = (sum(jx1) + 1):ncol(x)) <- 'Benign'
+    
+    # Run MAST
+    de$mast[[immune.cells[i]]] <- FindMarkers(
+      object = x,
+      ident.1 = 'Tumor',
+      ident.2 = 'Benign',
+      test.use = 'MAST',
+      verbose = TRUE,
+      max.cells.per.ident = 1000
+    )
+    
+    rm(x)
+    clear_memory()
+    
+  }, error = function(e) {
+    message(sprintf("Error in MAST analysis for %s: %s", immune.cells[i], e$message))
+    message("Attempting Wilcoxon test instead...")
+    
+    # Try Wilcoxon as fallback
+    de$mast[[immune.cells[i]]] <- FindMarkers(
+      object = x,
+      ident.1 = 'Tumor',
+      ident.2 = 'Benign',
+      test.use = 'wilcox',
+      verbose = TRUE,
+      max.cells.per.ident = 1000
+    )
+  })
+  
+  message(sprintf("Completed analysis for %s", immune.cells[i]))
+}
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+message("\nTotal analysis time: ", difftime(t.end, t.start, units = "mins"), " minutes")
+
+# Print summary of results
+message("\nSummary of analyses:")
+for (cell_type in immune.cells) {
+  if (cell_type %in% names(de$ttest)) {
+    n_ttest <- nrow(de$ttest[[cell_type]])
+    n_mast <- if(cell_type %in% names(de$mast)) nrow(de$mast[[cell_type]]) else 0
+    message(sprintf("%s: %d t-test DEGs, %d MAST DEGs", cell_type, n_ttest, n_mast))
+  }
+}
+
+```
+
+## Case: responder vs. non-responder (GSE120575)
+
+Comparison between responder vs. non-responder cells to immunotherapy. 
+Estimated runtime: ~1 hour.  
+
+```{r DE_response, warning=F, message=T, eval=!('response' %in% de$ttest)}
+# Start timer
+t.start <- Sys.time()
+
+# Make sure we have the expression data
+if (!exists("de") || is.null(de$data) || !is(de$data, "dgCMatrix")) {
+  message("Reloading expression data...")
+  de <- list()
+  de$data <- GetAssayData(object = data.all$proc, layer = "data")
+  if (!is(de$data, "dgCMatrix")) {
+    de$data <- as(de$data, "dgCMatrix")
+  }
+}
+
+# Define cell groups to compare
+ix <- rownames(obj$GSE120575)
+jx1 <- data.all$proc$Response %in% 'Responder'
+jx2 <- data.all$proc$Response %in% 'Non-responder'
+
+# Print cell counts
+message(sprintf("Number of responder cells: %d", sum(jx1)))
+message(sprintf("Number of non-responder cells: %d", sum(jx2)))
+
+# Subsample cells if too many
+max_cells_per_group <- 1000
+if(sum(jx1) > max_cells_per_group) {
+  set.seed(42)
+  cells_g1 <- sample(which(jx1), max_cells_per_group)
+  jx1[setdiff(which(jx1), cells_g1)] <- FALSE
+}
+if(sum(jx2) > max_cells_per_group) {
+  set.seed(42)
+  cells_g2 <- sample(which(jx2), max_cells_per_group)
+  jx2[setdiff(which(jx2), cells_g2)] <- FALSE
+}
+
+# DE analysis (t-test)
+message("Running t-test analysis...")
+x <- de$data[ix, jx1]
+y <- de$data[ix, jx2]
+de$ttest$response <- de_analyze(x, y) %>% na.omit
+rm(x, y)
+#clear_memory()
+
+# DE analysis (MAST)
+message("Running MAST analysis...")
+tryCatch({
+  # Create Seurat object
+  message("Creating Seurat object...")
+  combined_data <- cbind(de$data[ix, jx1], de$data[ix, jx2])
+  if (!is(combined_data, "dgCMatrix")) {
+    combined_data <- as(combined_data, "dgCMatrix")
+  }
+  x <- CreateSeuratObject(counts = combined_data)
+  rm(combined_data)
+  clear_memory()
+  
+  # Process data
+  message("Processing data...")
+  x <- x %>%
+    NormalizeData(verbose = FALSE) %>%
+    FindVariableFeatures(verbose = FALSE) %>%
+    ScaleData(verbose = FALSE) %>%
+    RunPCA(verbose = FALSE)
+  
+  # Set identities
+  message("Setting identities...")
+  cells_g1 <- 1:sum(jx1)
+  cells_g2 <- (sum(jx1) + 1):ncol(x)
+  Idents(object = x, cells = cells_g1) <- 'Responder'
+  Idents(object = x, cells = cells_g2) <- 'Non-responder'
+  
+  # Verify identities
+  if (!all(levels(Idents(x)) %in% c('Responder', 'Non-responder'))) {
+    stop("Failed to set identities correctly")
+  }
+  
+  # Run MAST
+  message("Running differential expression analysis...")
+  de$mast$response <- FindMarkers(
+    object = x,
+    ident.1 = 'Responder',
+    ident.2 = 'Non-responder',
+    test.use = 'MAST',
+    verbose = TRUE,
+    max.cells.per.ident = 1000,
+    min.pct = 0.1,
+    logfc.threshold = 0.25
+  )
+  
+  # Clean up
+  rm(x, cells_g1, cells_g2)
+  clear_memory()
+  
+}, error = function(e) {
+  message("Error in MAST analysis: ", e$message)
+  message("Attempting Wilcoxon test instead...")
+  
+  # Try Wilcoxon as fallback
+  de$mast$response <- FindMarkers(
+    object = x,
+    ident.1 = 'Responder',
+    ident.2 = 'Non-responder',
+    test.use = 'wilcox',
+    verbose = TRUE,
+    max.cells.per.ident = 1000,
+    min.pct = 0.1,
+    logfc.threshold = 0.25
+  )
+})
+
+# End timer + log time elapsed
+t.end <- Sys.time()
+message("\nAnalysis completed in: ", difftime(t.end, t.start, units = "mins"), " minutes")
+
+# Print summary
+if (!is.null(de$mast$response)) {
+  message("\nFound ", sum(de$mast$response$p_val_adj < 0.05), 
+          " significant DEGs (FDR < 0.05)")
+}
+
+```
+
+# Visualizations
+
+**Description**: visual inspection of DE analysis results. 
+
+## T-test vs. MAST DEGs
+
+Visual comparison of DEGs determined with t-test vs. MAST (venn diagrams).
+
+```{r DE_venn, warning=F, message=T}
+
+# Compare DEGs b/t the two methods
+f <- names(de$mast); p <- list()
+for (i in 1:length(f)) { 
+  x <- de$ttest[[f[i]]]; y <- de$mast[[f[i]]]
+  g <- intersect(x$gene[x$q.val < 0.05], row.names(y)[y$p_val_adj < 0.05])
+  # g <- intersect(x$gene[x$q.val < 0.05], y$gene[y$p_val_adj < 0.05]) 
+  cat(sprintf('No. of intersecting DEGs for %s: %d\n', f[i], length(g)))
+  ggvenn(list('t-test'=x$gene[x$q.val < 0.05], 
+              'MAST'=row.names(y)[y$p_val_adj < 0.05])) + ggtitle(f[i])
+  ggsave(paste0('plots/DE_venn_', f[i], '.pdf'), width=5, height=5, units='in')
+}
+
+```
+
+## Responder vs. non-responder DEGs
+
+Clustergram (or heatmap) of DEGs identified for responder vs. non-responder comparison. 
+
+```{r DE_response_heat, warning=F, message=T}
+# Modify DE_response_heat chunk
+tryCatch({
+  # Get significant genes
+  if (!exists("de") || is.null(de$mast$response)) {
+    stop("MAST results not found. Please run the DE analysis first.")
+  }
+  
+  sig_genes <- rownames(de$mast$response)[de$mast$response$p_val_adj < 0.05]
+  if (length(sig_genes) == 0) {
+    stop("No significant genes found (FDR < 0.05)")
+  }
+  message(sprintf("Found %d significant genes", length(sig_genes)))
+  
+  # Take top N genes by absolute log fold change
+  n <- min(50, length(sig_genes))
+  g <- sig_genes[order(abs(de$mast$response$avg_log2FC[match(sig_genes, rownames(de$mast$response))]), 
+                      decreasing = TRUE)][1:n]
+  
+  # Create anonymous gene IDs
+  anon_genes <- anonymize_genes(g)
+  
+  # Get all cells
+  jx1 <- which(data.all$proc$Response %in% 'Responder')
+  jx2 <- which(data.all$proc$Response %in% 'Non-responder')
+  
+  # Get expression data
+  x <- de$data[g, c(jx1, jx2)]
+  if (!is(x, "dgCMatrix")) {
+    x <- as(x, "dgCMatrix")
+  }
+  x <- as.matrix(x)
+  
+  # Replace gene names with anonymous IDs
+  rownames(x) <- anon_genes[rownames(x)]
+  
+  # Calculate mean expression for each group
+  x_resp <- rowMeans(x[, 1:length(jx1), drop=FALSE])
+  x_nonresp <- rowMeans(x[, (length(jx1)+1):ncol(x), drop=FALSE])
+  
+  # Combine into matrix
+  x_means <- cbind(x_resp, x_nonresp)
+  colnames(x_means) <- c("Responder\n(mean)", "Non-responder\n(mean)")
+  
+  # Calculate standard errors for error bars
+  x_resp_se <- apply(x[, 1:length(jx1), drop=FALSE], 1, function(x) sd(x)/sqrt(length(x)))
+  x_nonresp_se <- apply(x[, (length(jx1)+1):ncol(x), drop=FALSE], 1, function(x) sd(x)/sqrt(length(x)))
+  
+  # Add SE information to rownames
+  rownames(x_means) <- sprintf("%s\n(SE: %.2f, %.2f)", 
+                              rownames(x_means), 
+                              x_resp_se, 
+                              x_nonresp_se)
+  
+  # Scale data
+  x_scaled <- t(scale(t(x_means)))
+  
+  # Create annotation
+  col.annot <- data.frame(
+    Group = c('Responder', 'Non-responder'),
+    row.names = colnames(x_means)
+  )
+  
+  # Color palette
+  col.pal <- colorRampPalette(colors = c('navy', 'white', 'red'))(100)
+  
+  # Create heatmap
+  message("Generating heatmap...")
+  p <- pheatmap(
+    x_scaled,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    scale = "none",  # already scaled above
+    color = col.pal,
+    annotation_col = col.annot,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = sprintf('Top %d De-identified DEGs (Mean Expression)', nrow(x_scaled)),
+    fontsize_row = 8,
+    annotation_colors = list(
+      Group = c('Responder' = '#E41A1C', 'Non-responder' = '#377EB8')
+    )
+  )
+  
+  # Save plot
+  message("Saving plot...")
+  pdf('plots/DE_heatmap_response_collapsed.pdf', width = 11, height = 8)
+  print(p)
+  dev.off()
+  
+  # Save gene ID mapping
+  write.csv(data.frame(
+    Anonymous_ID = names(anon_genes),
+    Original_Gene = anon_genes,
+    Mean_Responder = x_resp,
+    SE_Responder = x_resp_se,
+    Mean_NonResponder = x_nonresp,
+    SE_NonResponder = x_nonresp_se
+  ), './response_gene_mapping_with_stats.csv', row.names = FALSE)
+  
+  message("Heatmap generated successfully")
+  message("Gene mapping with statistics saved to results/response_gene_mapping_with_stats.csv")
+  
+}, error = function(e) {
+  message(sprintf("Error generating heatmap: %s", e$message))
+})
+```
+# Add new chunk after DE_response_heat
+```{r DE_response_heat_individual, warning=F, message=T}
+# Show individual cell heatmap alongside collapsed view
+tryCatch({
+  # Get significant genes
+  if (!exists("de") || is.null(de$mast$response)) {
+    stop("MAST results not found. Please run the DE analysis first.")
+  }
+  
+  sig_genes <- rownames(de$mast$response)[de$mast$response$p_val_adj < 0.05]
+  if (length(sig_genes) == 0) {
+    stop("No significant genes found (FDR < 0.05)")
+  }
+  message(sprintf("Found %d significant genes", length(sig_genes)))
+  
+  # Take top N genes by absolute log fold change
+  n <- min(50, length(sig_genes))
+  g <- sig_genes[order(abs(de$mast$response$avg_log2FC[match(sig_genes, rownames(de$mast$response))]), 
+                      decreasing = TRUE)][1:n]
+  
+  # Create anonymous gene IDs
+  anon_genes <- anonymize_genes(g)
+  
+  # Get cells (subsample to make visualization manageable)
+  jx1 <- which(data.all$proc$Response %in% 'Responder')
+  jx2 <- which(data.all$proc$Response %in% 'Non-responder')
+  
+  # Subsample cells
+  cells_per_group <- min(25, min(length(jx1), length(jx2)))
+  set.seed(42)
+  sampled_jx1 <- sample(jx1, cells_per_group)
+  sampled_jx2 <- sample(jx2, cells_per_group)
+  
+  # Get expression data for individual cells
+  x_individual <- de$data[g, c(sampled_jx1, sampled_jx2)]
+  if (!is(x_individual, "dgCMatrix")) {
+    x_individual <- as(x_individual, "dgCMatrix")
+  }
+  x_individual <- as.matrix(x_individual)
+  
+  # Clean individual cell data
+  message("Cleaning individual cell data...")
+  # Replace Inf/-Inf with NA
+  x_individual[is.infinite(x_individual)] <- NA
+  # Remove rows (genes) with any NA values
+  complete_rows <- complete.cases(x_individual)
+  if (!all(complete_rows)) {
+    message(sprintf("Removing %d genes with NA values", sum(!complete_rows)))
+    x_individual <- x_individual[complete_rows, ]
+    g <- g[complete_rows]
+    anon_genes <- anon_genes[complete_rows]
+  }
+  
+  # Check for zero variance genes
+  gene_var <- apply(x_individual, 1, var)
+  if (any(gene_var == 0)) {
+    message(sprintf("Removing %d genes with zero variance", sum(gene_var == 0)))
+    x_individual <- x_individual[gene_var > 0, ]
+    g <- g[gene_var > 0]
+    anon_genes <- anon_genes[gene_var > 0]
+  }
+  
+  # Replace gene names with anonymous IDs
+  rownames(x_individual) <- anon_genes[rownames(x_individual)]
+  
+  # Scale individual cell data with validation
+  message("Scaling individual cell data...")
+  x_individual_scaled <- t(scale(t(x_individual)))
+  # Check for NA/Inf values after scaling
+  if (any(is.na(x_individual_scaled)) || any(is.infinite(x_individual_scaled))) {
+    message("Found NA/Inf values after scaling, capping extreme values at ±10")
+    x_individual_scaled[x_individual_scaled > 10] <- 10
+    x_individual_scaled[x_individual_scaled < -10] <- -10
+    x_individual_scaled[is.na(x_individual_scaled)] <- 0
+  }
+  
+  # Create annotation for individual cells
+  col.annot.individual <- data.frame(
+    Response = rep(c('Responder', 'Non-responder'), each = cells_per_group),
+    row.names = colnames(x_individual)
+  )
+  
+  # Get mean expression data (for side-by-side comparison)
+  x_resp <- rowMeans(de$data[g, jx1, drop=FALSE])
+  x_nonresp <- rowMeans(de$data[g, jx2, drop=FALSE])
+  x_means <- cbind(x_resp, x_nonresp)
+  colnames(x_means) <- c("Responder\n(mean)", "Non-responder\n(mean)")
+  
+  # Calculate standard errors
+  x_resp_se <- apply(de$data[g, jx1, drop=FALSE], 1, function(x) sd(x)/sqrt(length(x)))
+  x_nonresp_se <- apply(de$data[g, jx2, drop=FALSE], 1, function(x) sd(x)/sqrt(length(x)))
+  
+  # Clean mean data
+  message("Cleaning mean data...")
+  x_means[is.infinite(x_means)] <- NA
+  complete_rows_means <- complete.cases(x_means)
+  if (!all(complete_rows_means)) {
+    message(sprintf("Removing %d genes with NA values from means", sum(!complete_rows_means)))
+    x_means <- x_means[complete_rows_means, ]
+    x_resp_se <- x_resp_se[complete_rows_means]
+    x_nonresp_se <- x_nonresp_se[complete_rows_means]
+  }
+  
+  # Add SE information to rownames for mean data
+  rownames(x_means) <- sprintf("%s\n(SE: %.2f, %.2f)", 
+                              anon_genes[rownames(x_means)], 
+                              x_resp_se, 
+                              x_nonresp_se)
+  
+  # Scale mean data with validation
+  message("Scaling mean data...")
+  x_means_scaled <- t(scale(t(x_means)))
+  if (any(is.na(x_means_scaled)) || any(is.infinite(x_means_scaled))) {
+    message("Found NA/Inf values after scaling means, capping extreme values at ±10")
+    x_means_scaled[x_means_scaled > 10] <- 10
+    x_means_scaled[x_means_scaled < -10] <- -10
+    x_means_scaled[is.na(x_means_scaled)] <- 0
+  }
+  
+  # Create annotation for means
+  col.annot.means <- data.frame(
+    Group = c('Responder', 'Non-responder'),
+    row.names = colnames(x_means)
+  )
+  
+  # Color palette
+  col.pal <- colorRampPalette(colors = c('navy', 'white', 'red'))(100)
+  
+  message("Generating plots...")
+  # Create individual cells heatmap
+  p1 <- pheatmap(
+    x_individual_scaled,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = col.pal,
+    annotation_col = col.annot.individual,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    gaps_col = cells_per_group,
+    main = sprintf('Individual Cells\n(n=%d per group)', cells_per_group),
+    fontsize_row = 8,
+    annotation_colors = list(
+      Response = c('Responder' = '#E41A1C', 'Non-responder' = '#377EB8')
+    ),
+    legend = FALSE,  # Hide colorbar
+    treeheight_row = 0,  # Hide row dendrogram
+    cellwidth = 10,  # Force square cells
+    cellheight = 10  # Force square cells
+  )
+  
+  # Create mean expression heatmap
+  p2 <- pheatmap(
+    x_means_scaled,
+    cluster_rows = TRUE,
+    cluster_cols = FALSE,
+    scale = "none",
+    color = col.pal,
+    annotation_col = col.annot.means,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    main = 'Group Means\n(all cells)',
+    fontsize_row = 8,
+    annotation_colors = list(
+      Group = c('Responder' = '#E41A1C', 'Non-responder' = '#377EB8')
+    ),
+    legend = FALSE,  # Hide colorbar
+    treeheight_row = 0,  # Hide row dendrogram
+    cellwidth = 20,  # Force square cells (larger since fewer columns)
+    cellheight = 20,  # Force square cells (larger since fewer columns)
+    labels_row = sub("\n.*", "", rownames(x_means))  # Only show gene IDs without SE info
+  )
+  
+  # Save plots to PDF
+  pdf('plots/DE_heatmap_response_comparison.pdf', width = 15, height = 8)
+  grid::grid.newpage()
+  grid::grid.draw(gridExtra::grid.arrange(p1$gtable, p2$gtable, ncol=2))
+  dev.off()
+  
+  # Display plots in notebook
+  grid::grid.newpage()
+  grid::grid.draw(gridExtra::grid.arrange(p1$gtable, p2$gtable, ncol=2))
+  
+  # Save detailed statistics
+  write.csv(data.frame(
+    Anonymous_ID = names(anon_genes),
+    Original_Gene = anon_genes,
+    Mean_Responder = x_resp,
+    SE_Responder = x_resp_se,
+    Mean_NonResponder = x_nonresp,
+    SE_NonResponder = x_nonresp_se,
+    N_Responder = length(jx1),
+    N_NonResponder = length(jx2)
+  ), 'results/response_gene_mapping_detailed.csv', row.names = FALSE)
+  
+  message("Side-by-side heatmaps generated successfully")
+  message("Detailed gene statistics saved to results/response_gene_mapping_detailed.csv")
+  
+}, error = function(e) {
+  message(sprintf("Error generating heatmaps: %s", e$message))
+  message("\nDebugging information:")
+  message("1. Check if expression data contains extreme values")
+  message("2. Verify gene filtering and scaling steps")
+  message("3. Ensure all matrices have proper dimensions")
+  message("4. Look for NA/Inf values in the data")
+})
+```
+
+PCA of DEGs identified for responder vs. non-responder comparison. 
+
+```{r DE_response_PCA, warning=F, message=T}
+# Modify DE_response_PCA chunk
+tryCatch({
+  # Validate MAST results exist
+  if (!exists("de") || is.null(de$mast$response)) {
+    stop("MAST results not found. Please run the DE analysis first.")
+  }
+  
+  # Get significant genes
+  sig_genes <- rownames(de$mast$response)[de$mast$response$p_val_adj < 0.05]
+  if (length(sig_genes) == 0) {
+    stop("No significant genes found (FDR < 0.05)")
+  }
+  message(sprintf("Found %d significant genes", length(sig_genes)))
+  
+  # Get responder/non-responder cells
+  jx <- data.all$proc$Response %in% c('Responder', 'Non-responder')
+  if (sum(jx) == 0) {
+    stop("No cells found matching response criteria")
+  }
+  message(sprintf("Found %d cells (%d Responders, %d Non-responders)", 
+                 sum(jx),
+                 sum(data.all$proc$Response[jx] == "Responder"),
+                 sum(data.all$proc$Response[jx] == "Non-responder")))
+  
+  # Subsample cells if too many
+  max_cells_per_group <- 1000
+  responder_idx <- which(data.all$proc$Response[jx] == "Responder")
+  nonresponder_idx <- which(data.all$proc$Response[jx] == "Non-responder")
+  
+  if (length(responder_idx) > max_cells_per_group) {
+    set.seed(42)
+    responder_idx <- sample(responder_idx, max_cells_per_group)
+  }
+  if (length(nonresponder_idx) > max_cells_per_group) {
+    set.seed(42)
+    nonresponder_idx <- sample(nonresponder_idx, max_cells_per_group)
+  }
+  
+  selected_cells <- c(responder_idx, nonresponder_idx)
+  
+  # Get expression data
+  x <- de$data[sig_genes, jx][, selected_cells]
+  if (!is(x, "dgCMatrix")) {
+    x <- as(x, "dgCMatrix")
+  }
+  x <- as.matrix(x)
+  
+  # Create anonymous gene IDs
+  anon_genes <- anonymize_genes(rownames(x))
+  rownames(x) <- anon_genes[rownames(x)]
+  
+  # Handle zero variance genes
+  gene_var <- apply(x, 1, var)
+  if (any(gene_var == 0)) {
+    message(sprintf("Removing %d genes with zero variance", sum(gene_var == 0)))
+    x <- x[gene_var > 0, ]
+  }
+  
+  # Clean data
+  x[is.infinite(x)] <- NA
+  x[is.na(x)] <- 0
+  
+  # Transpose and convert to data frame
+  x_t <- t(x)
+  
+  # Create metadata
+  m <- data.frame(
+    Response = data.all$proc$Response[jx][selected_cells],
+    row.names = rownames(x_t)
+  )
+  
+  # Apply PCA with validation
+  if (ncol(x_t) < 2) {
+    stop("Need at least 2 features for PCA")
+  }
+  if (nrow(x_t) < 3) {
+    stop("Need at least 3 samples for PCA")
+  }
+  
+  message("Running PCA...")
+  response_pca <- prcomp(x_t, scale. = TRUE)
+  
+  # Calculate variance explained
+  var_explained <- summary(response_pca)$importance[2, 1:2] * 100
+  
+  # Calculate group centroids
+  centroids <- aggregate(cbind(PC1, PC2) ~ Response, 
+                        data = cbind(as.data.frame(response_pca$x[,1:2]), m), 
+                        FUN = mean)
+  
+  # Create enhanced PCA plot
+  p <- ggplot(data = as.data.frame(response_pca$x[,1:2]), 
+              aes(x = PC1, y = PC2, color = m$Response)) +
+    # Add points with reduced alpha for transparency
+    geom_point(alpha = 0.3, size = 2) +
+    # Add confidence ellipses
+    stat_ellipse(level = 0.95, size = 1) +
+    # Add centroids
+    geom_point(data = centroids, aes(x = PC1, y = PC2), 
+               size = 5, shape = 18) +
+    # Add centroid labels
+    geom_text(data = centroids, 
+              aes(x = PC1, y = PC2, label = Response),
+              vjust = -1.5, size = 4, color = "black") +
+    # Customize appearance
+    ggtitle('De-identified DEG PCA with Group Trends') +
+    xlab(sprintf("PC1 (%.1f%%)", var_explained[1])) +
+    ylab(sprintf("PC2 (%.1f%%)", var_explained[2])) +
+    theme_minimal() +
+    scale_color_manual(values = c('Responder' = '#E41A1C', 'Non-responder' = '#377EB8')) +
+    theme(
+      legend.position = "bottom",
+      plot.title = element_text(hjust = 0.5, size = 14),
+      axis.title = element_text(size = 12),
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 10)
+    )
+  
+  # Save plot
+  message("Saving plot...")
+  ggsave('plots/DE_PCA_response_collapsed.pdf', plot = p, width = 8, height = 8, units = 'in')
+  
+  # Display plot
+  print(p)
+  
+  message("PCA visualization completed successfully")
+  
+}, error = function(e) {
+  message(sprintf("Error in PCA analysis: %s", e$message))
+  message("Please ensure:")
+  message("1. DE analysis has been run successfully")
+  message("2. There are significant DEGs to analyze")
+  message("3. There are enough cells in each response group")
+  message("4. Expression data is valid and contains sufficient variation")
+})
+```
+
+## Tumor vs. benign DEGs
+
+Clustergram (or heatmap) of DEGs identified for tumor vs. benign comparison. 
+
+```{r DE_tumor_heat, warning=F, message=T}
+
+# Define data to plot
+n <- 50
+g <- de$mast$tumor$gene[1:n]
+jx1 <- which(data.all$proc$Source == names(obj)[3] | 
+  data.all$proc$Malignant %in% 'Yes')[1:(n/2)]
+jx2 <- which(data.all$proc$Source == names(obj)[4])[1:(n/2)]
+x <- de$data[g, c(jx1, jx2)] %>% as.data.frame(.)
+
+# Specify heatmap arguments
+#   color palette
+col.pal <- colorRampPalette(colors=c('white', 'red'), space='Lab')(100)
+#   column annotations (response)
+col.annot <- data.frame(Malignant=rep(c('Yes', 'No'), each=n/2), 
+                        row.names=colnames(x))
+  
+# Heatmap
+p <- pheatmap(x, cluster_rows=T, cluster_cols=F, scale='none', color=col.pal, 
+              annotation_col=col.annot, cellheight=(500/n), cellwidth=(500/n), 
+              show_rownames=T, show_colnames=F, gaps_col=n/2, 
+              main='DEG heatmap (tumor)')
+  
+# Save plot
+#tiff('plots/DE_heatmap_tumor.tiff', units='in', width=11, height=8, res=300)
+print({p}); dev.off()
+
+```
+
+PCA of DEGs identified for tumor vs. benign comparison. 
+
+```{r DE_tumor_PCA, warning=F, message=T}
+# Define data to plot
+tryCatch({
+  # Validate MAST results exist
+  if (!exists("de") || is.null(de$mast$tumor)) {
+    stop("MAST results not found. Please run the tumor DE analysis first.")
+  }
+  
+  # Get significant genes
+  sig_genes <- rownames(de$mast$tumor)[de$mast$tumor$p_val_adj < 0.05]
+  if (length(sig_genes) == 0) {
+    stop("No significant genes found (FDR < 0.05)")
+  }
+  message(sprintf("Found %d significant genes", length(sig_genes)))
+  
+  # Take top N genes by absolute log fold change
+  n <- min(100, length(sig_genes))
+  g <- sig_genes[order(abs(de$mast$tumor$avg_log2FC[match(sig_genes, rownames(de$mast$tumor))]), 
+                      decreasing = TRUE)][1:n]
+  
+  # Get tumor/benign cells
+  jx1 <- data.all$proc$Source == names(obj)[3] | data.all$proc$Malignant %in% 'Yes'
+  jx2 <- data.all$proc$Source == names(obj)[4]
+  
+  if (sum(jx1) == 0 || sum(jx2) == 0) {
+    stop("Insufficient cells in one or both groups")
+  }
+  message(sprintf("Found %d cells (%d Tumor, %d Benign)", 
+                 sum(jx1) + sum(jx2), sum(jx1), sum(jx2)))
+  
+  # Subsample cells if too many
+  max_cells_per_group <- 1000
+  if (sum(jx1) > max_cells_per_group) {
+    set.seed(42)
+    tumor_cells <- sample(which(jx1), max_cells_per_group)
+    jx1[setdiff(which(jx1), tumor_cells)] <- FALSE
+  }
+  if (sum(jx2) > max_cells_per_group) {
+    set.seed(42)
+    benign_cells <- sample(which(jx2), max_cells_per_group)
+    jx2[setdiff(which(jx2), benign_cells)] <- FALSE
+  }
+  
+  # Get expression data
+  x <- de$data[g, c(which(jx1), which(jx2))]
+  if (!is(x, "dgCMatrix")) {
+    x <- as(x, "dgCMatrix")
+  }
+  x <- as.matrix(x)
+  
+  # Handle zero variance genes
+  gene_var <- apply(x, 1, var)
+  if (any(gene_var == 0)) {
+    message(sprintf("Removing %d genes with zero variance", sum(gene_var == 0)))
+    x <- x[gene_var > 0, ]
+    g <- g[gene_var > 0]
+  }
+  
+  # Clean data
+  x[is.infinite(x)] <- NA
+  x[is.na(x)] <- 0
+  
+  # Transpose and convert to data frame
+  x_t <- t(x)
+  
+  # Create metadata
+  m <- data.frame(
+    Malignant = rep(c('Yes', 'No'), c(sum(jx1), sum(jx2))),
+    row.names = rownames(x_t)
+  )
+  
+  # Apply PCA with validation
+  if (ncol(x_t) < 2) {
+    stop("Need at least 2 features for PCA")
+  }
+  if (nrow(x_t) < 3) {
+    stop("Need at least 3 samples for PCA")
+  }
+  
+  message("Running PCA...")
+  pca.tumor <- prcomp(x_t, scale. = TRUE)
+  
+  # Calculate variance explained
+  var_explained <- summary(pca.tumor)$importance[2, 1:2] * 100
+  
+  # Visualize PCA plot with variance explained
+  p <- autoplot(pca.tumor, data = m, colour = 'Malignant') +
+    ggtitle('DEG PCA (tumor)') +
+    xlab(sprintf("PC1 (%.1f%%)", var_explained[1])) +
+    ylab(sprintf("PC2 (%.1f%%)", var_explained[2])) +
+    theme_minimal() +
+    scale_color_manual(values = c('Yes' = '#E41A1C', 'No' = '#377EB8'))
+  
+  # Save plot
+  message("Saving plot...")
+  ggsave('plots/DE_PCA_tumor.pdf', plot = p, width = 8, height = 6, units = 'in')
+  
+  # Display plot
+  print(p)
+  
+  # Return success message
+  message("PCA visualization completed successfully")
+  
+}, error = function(e) {
+  message(sprintf("Error in PCA analysis: %s", e$message))
+  message("Please ensure:")
+  message("1. Tumor DE analysis has been run successfully")
+  message("2. There are significant DEGs to analyze")
+  message("3. There are enough cells in each group")
+  message("4. Expression data is valid and contains sufficient variation")
+})
+```
+
+# Save results (if prompted)
+
+```{r save_outputs, warning=F, message=T}
+
+#save.data <- dlgInput('Save all results? (T/F)', F)$res %>% as.logical(.)
+#if (save.data) { 
+#  # t-test results
+#  write.xlsx(de$ttest, 'results/DE_ttest.xlsx', row.names=F)
+#  # MAST results
+#  write.xlsx(de$mast, 'results/DE_MAST.xlsx', row.names=T)
+#}
+
+```

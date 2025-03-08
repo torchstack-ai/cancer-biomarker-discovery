@@ -1,0 +1,519 @@
+---
+title: "Analysis of scRNA-seq data"
+date: "Last modified: `r format(Sys.time(), '%B %d, %Y')`"
+tags: [scRNA-seq, seurat, melanoma, immunotherapy, PBMCs] 
+output:
+  html_document:
+    theme: flatly
+    highlight: zenburn
+    toc: true
+    number_sections: false
+    toc_depth: 2
+    toc_float:
+      collapsed: false
+      smooth_scroll: true
+    code_folding: hide
+    self_contained: yes
+---
+
+# Project Description
+
+This project aims to identify therapeutic targets for melanoma patients by following a 2-phase approach:
+
+-   Phase I: Analyze scRNA-seq data to identify DE genes and infer enriched pathways\
+-   Phase II: Compare responders vs. non-responders to identify therapeutic targets
+
+## Dataset Description
+
+This analysis integrates five complementary single-cell RNA sequencing datasets:
+
+1. Dataset 1 (Treatment Response Dataset)
+   - Contains treatment response data
+   - Includes responder/non-responder classifications
+   - Focus on immunotherapy outcomes
+
+2. Dataset 2 (Tumor Cell Dataset)
+   - Characterizes tumor cell heterogeneity
+   - Includes cell type annotations
+   - Focus on tumor cell populations
+
+3. Dataset 3 (Tumor Microenvironment Dataset)
+   - Maps the tumor microenvironment
+   - Contains malignant/non-malignant classifications
+   - Includes detailed immune cell typing
+
+4. Dataset 4 (Control Melanocyte Dataset)
+   - Normal melanocyte control data
+   - Reference for non-malignant state
+   - Baseline expression profiles
+
+5. Dataset 5 (Control Immune Dataset)
+   - Normal immune cell control data
+   - Reference for immune cell states
+   - Baseline immune profiles
+
+## Strategy
+
+Use `seurat` and `harmony` to complete the following tasks:
+
+1.  Load/process/combine data\
+2.  Clustering and biomarker determination\
+3.  Comparisons: disease vs. control
+
+# Initialize environment
+
+Install required packages.
+
+```{r install_packages, results="hide", message=F, warning=F, error=F}
+
+# Define packages to install
+pkg.list = c('svDialogs', 'vroom', 'dplyr', 'DT', 'Seurat', 'harmony', 
+             'patchwork', 'ggplot2', 'ggrepel', 'openxlsx', 'progress')
+
+# Define packages not already installed
+pkg.install <- pkg.list[!(pkg.list %in% installed.packages()[, 'Package'])]
+
+# Install uninstalled packages
+if (length(pkg.install) > 0) {
+  install.packages(pkg.install)
+}
+
+```
+
+Load installed packages.
+
+```{r load_packages, results="hide", message=F, warning=F, error=F}
+
+# Load packages
+library(svDialogs)    # for prompting user-input
+library(vroom)        # for quickly reading data
+library(dplyr)        # for data processing
+library(DT)           # to display datatables
+library(Seurat)       # for scRNA-seq analysis
+library(harmony)      # to integration scRNA-seq data
+library(patchwork)    # for combining plots
+library(ggplot2)      # for data visualization
+library(ggrepel)      # to use geom_pont_repel()
+library(openxlsx)     # to write data to excel
+library(progress)     # to display progress bar
+
+```
+
+Define custom functions.
+
+```{r custom_functions, results="hide", message=F, warning=F, error=F}
+
+# qc_filter(): filter data based on QC for scRNA-seq data
+qc_filter <- function(obj, feat.t=c(200, 2500), pct.mt.t=5, var.method='vst', 
+                      feat.n=2000, qc.plot=T, top.n=10, title='') {
+  
+  ############################ FUNCTION DESCRIPTION ############################
+  # feat.t = lower and upper limits on unique gene counts
+  # pct.mt.t = threshold of level in mitochondrial contamination
+  # var.method = method for selecting highly variable genes
+  # feat.n = number of variable genes to select
+  # qc.plot = boolean whether to generate plots to decide downstream analyses
+  # title = string to use for plot title
+  ############################## BEGIN FUNCTION ################################
+  
+  # determine percentage of mitochondrial contamination
+  obj[['pct.mt']] <- PercentageFeatureSet(obj, pattern='^MT-')
+  # filter + nomalize + scale data
+  obj <- obj %>% 
+    subset(., subset=(nFeature_RNA > feat.t[1]) & (nFeature_RNA < feat.t[2]) & 
+             (pct.mt < pct.mt.t)) %>% NormalizeData(.) %>% 
+    FindVariableFeatures(., selection.method=var.method) %>% 
+    ScaleData(.) %>% RunPCA(., features=VariableFeatures(object=.))
+  # generate follow-up QC plots (if prompted)
+  if (qc.plot) { 
+    p1 <- VariableFeaturePlot(obj) %>% 
+      LabelPoints(plot=., points=head(VariableFeatures(obj), top.n), repel=T)
+    p2 <- ElbowPlot(obj)
+    plot(p1 + p2 + plot_annotation(title=title))
+  }
+  # return output
+  return(obj)
+}
+
+# de_analyze(): conduct differential expression (DE) analysis
+de_analyze <- function(m1, m2, alt='two.sided', paired=F, var.equal=F, 
+                       adj.method='bonferroni', t=0.05, de.plot=F, title='') { 
+  
+  ############################ FUNCTION DESCRIPTION ############################
+  # m1, m2 = expression matrices to compare
+  # alt, paired, var.equal = arguments for t.test() function
+  # adj.method = method for calculating adjusted p-value
+  # t = threshold for significance 
+  # de.plot = boolean whether to generate a volcano plot
+  ############################## BEGIN FUNCTION ################################
+  
+  # make sure two matrices have same number of rows
+  if (nrow(m1) != nrow(m2)) { 
+    stop('Row length does not match between the provided matrices.')
+  }
+  # make sure gene names align between matrices
+  if (!all(rownames(m1) == rownames(m2))) { 
+    stop('Gene names do not align between provided matrices.')
+    }
+  # instantiate output variable
+  results <- data.frame(gene=rownames(m1), 
+                        t.stat=vector(mode='numeric', length=nrow(m1)), 
+                        p.val=vector(mode='numeric', length=nrow(m1)))
+  # conduct unpaired t-test with unequal variance for each gene
+  pb <- progress_bar$new(
+    format='  analyzing [:bar] :percent time left: :eta', total=nrow(m1))
+  for (i in 1:nrow(m1)) { 
+    pb$tick()
+    x <- m1[i, ]; y <- m2[i, ]
+    r <- t.test(x, y, alternative=alt, paired=paired, var.equal=var.equal)
+    results$t.stat[i] <- r$statistic
+    results$p.val[i] <- r$p.value
+  }
+  # determine adjusted p-values
+  results$q.val <- p.adjust(results$p.val, method=adj.method)
+  # add additional fields
+  results <- results %>%
+    mutate(Significance=case_when(q.val < t & t.stat > 0 ~ 'Up',
+                                  q.val < t & t.stat < 0 ~ 'Down',
+                                  T ~ 'NS')) %>% arrange(q.val)
+  # generate volcano plot (if prompted)
+  if (de.plot) { 
+    p <- results %>% arrange(t.stat) %>% ggplot(data=., 
+           aes(x=t.stat, y=-log10(q.val), col=Significance, label=gene)) +
+      geom_point() + geom_text_repel() + theme_minimal() + 
+      scale_color_manual(values=c('blue', 'black', 'red')) + ggtitle(title)
+    plot(p)
+  }
+  # return output
+  return(results)
+}
+
+```
+
+Additional settings.
+
+```{r settings}
+
+# Adjust system settings
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 2)
+
+# Save plots? (default: F)
+save.plots <- dlgInput('Save all outputs? (T/F)', F)$res
+
+```
+
+# Tasks
+
+## 1. Load/process/combine data
+
+**Description**: load all scRNA-seq files.
+
+```{r load_data, warning=F, message=F}
+setwd("..")
+# Load workspace (if it exists)
+f <- list.files()
+if (any(endsWith(f, '.RData'))) {
+  load(f[endsWith(f, '.RData')][1])
+}
+```
+
+```{r load_data, warning=F, message=F}
+##################### ONLY RUN IF THERE'S NO WORKSPACE #########################
+# # Load disease datasets
+# obj <- list(); meta <- list()
+# #   Dataset 1: Treatment response dataset
+# meta$dataset1 <- read.delim(file='data/dataset1/metadata.txt')
+# x <- vroom('data/dataset1/counts.txt', col_names=F)
+# x <- x[, 1:nrow(meta$dataset1)] %>% as.matrix(.)
+# y <- read.delim('data/dataset1/genes.txt', header=F)
+# rownames(x) <- make.unique(y$V1)
+# colnames(x) <- meta$dataset1$ID
+# obj$dataset1 <- CreateSeuratObject(x, project='dataset1',
+#                                     min.cells=3, min.features=200)
+# obj$dataset1$Treatment <- as.factor(meta$dataset1$Treatment)
+# obj$dataset1$Response <- as.factor(meta$dataset1$Response)
+# rm(x, y); gc()
+# 
+# #   Dataset 2: Tumor cell dataset
+# meta$dataset2 <- read.csv('data/dataset2/metadata.csv')
+# x <- vroom('data/dataset2/expression_matrix.csv')
+# y <- as.matrix(x[, -1]); rownames(y) <- x$...1
+# obj$dataset2 <- CreateSeuratObject(y, project='dataset2',
+#                                     min.cells=3, min.features=200)
+# obj$dataset2$type <- as.factor(meta$dataset2$cell.types)
+# 
+# #   Dataset 3: Tumor microenvironment dataset
+# x <- vroom('data/dataset3/expression_matrix.txt')
+# y <- as.matrix(x[-c(1:3), -1]); rownames(y) <- x$Cell[-c(1:3)]
+# obj$dataset3 <- CreateSeuratObject(y, project='dataset3',
+#                                    min.cells=3, min.features=200)
+# meta$dataset3 <- data.frame(Tumor=t(x[1, -1]),
+#                             Malignant=case_when(x[2, -1] == 1 ~ 'No',
+#                                                 x[2, -1] == 2 ~ 'Yes',
+#                                                 x[2, -1] == 0 ~ 'Unresolved'),
+#                             NMType=case_when(x[3, -1] == 1 ~ 'T',
+#                                              x[3, -1] == 2 ~ 'B',
+#                                              x[3, -1] == 3 ~ 'Macro',
+#                                              x[3, -1] == 4 ~ 'Endo',
+#                                              x[3, -1] == 5 ~ 'CAF',
+#                                              x[3, -1] == 6 ~ 'NK',
+#                                              x[3, -1] == 0 ~ 'NA'))
+# obj$dataset3$Malignant <- meta$dataset3$Malignant
+# obj$dataset3$NMType <- meta$dataset3$NMType
+# 
+# # Load control datasets
+# #   Dataset 4: Control melanocyte dataset
+# x <- vroom('data/dataset4/expression_matrix.csv')
+# y <- as.matrix(x[, -1]); rownames(y) <- x$...1
+# obj$dataset4 <- CreateSeuratObject(y, project='dataset4',
+#                                     min.cells=3, min.features=200)
+# 
+# #   Dataset 5: Control immune dataset
+# meta$dataset5 <- read.table('data/dataset5/metadata.tsv',
+#                              sep='\t', header=T)
+# x <- vroom('data/dataset5/matrix.tsv')
+# y <- as.matrix(x[, -1]); rownames(y) <- x$Gene.Name
+# obj$dataset5 <- CreateSeuratObject(y, project='dataset5',
+#                                     min.cells=3, min.features=200)
+# obj$dataset5$sample <- as.factor(meta$dataset5$sample)
+# rm(f, x, y, meta); gc()
+
+```
+
+*Description*: Combine all datasets together into single Seurat object. Also apply `harmony` to remove clustering bias based on dataset source.
+
+```{r combine_data, warning=F, message=F}
+file_path <- "/Users/scampit/Projects/torchstack/cancer-biomarker-discovery"
+setwd(file_path)
+
+# Combine all datasets
+if (!exists('data.all')) { 
+  data.all <- list()
+}
+if (!('raw' %in% names(data.all))) { 
+  data.all$raw <- merge(obj$dataset1, obj$dataset2) %>%
+    merge(., obj$dataset3) %>% merge(., obj$dataset4) %>% merge(., obj$dataset5)
+}
+
+# Add source information
+if (!('Source' %in% names(data.all$raw@meta.data))) { 
+  data.all$raw$Source <- c(rep(names(obj)[1], ncol(obj$dataset1)),
+                           rep(names(obj)[2], ncol(obj$dataset2)),
+                           rep(names(obj)[3], ncol(obj$dataset3)),
+                           rep(names(obj)[4], ncol(obj$dataset4)),
+                           rep(names(obj)[5], ncol(obj$dataset5)))
+}
+
+# Apply QC
+if (!('proc' %in% names(data.all))) { 
+  data.all$proc <- qc_filter(data.all$raw)
+}
+
+# Visualize integration results
+p1 <- DimPlot(object=data.all$proc, reduction='pca', pt.size=0.1, 
+              group.by='Source')
+p2 <- VlnPlot(object=data.all$proc, features='PC_1', pt.size=0.1, 
+              group.by='Source')
+p1 + p2
+if (save.plots) { 
+  ggsave('plots/QC_no_harmony.pdf', width=10, height=5, units='in')
+}
+
+# Apply harmony (to remove clustering based on dataset source)
+if (!('harmony' %in% names(data.all$proc@reductions))) { 
+  data.all$proc <- data.all$proc %>% RunHarmony('Source', plot_convergence=T)
+}
+
+# Visualize integration results (after harmony)
+p1 <- DimPlot(object=data.all$proc, reduction='harmony', pt.size=0.1, 
+              group.by='Source')
+p2 <- VlnPlot(object=data.all$proc, features='harmony_1', pt.size=0.1, 
+              group.by='Source')
+p1 + p2
+if (save.plots) { 
+  ggsave('plots/QC_w_harmony.pdf', width=10, height=5, units='in')
+}
+
+```
+
+## 2. Clustering and biomarker determination
+
+**Description**: cluster cells based on UMAP and determine biomarkers based on cluster assignment.
+
+### Clustering
+
+```{r clustering, warning=F, message=T}
+
+# Visualize UMAP plots (runtime: ~5 minutes)
+if (!('umap' %in% names(data.all$proc@reductions))) { 
+  data.all$proc <- data.all$proc %>% 
+      RunUMAP(reduction='harmony', dims=1:20) %>% 
+      FindNeighbors(reduction='harmony', dims=1:20) %>% 
+      FindClusters(resolution=0.5) %>% identity()
+}
+
+#   by dataset source
+p <- DimPlot(data.all$proc, reduction='umap', group.by='Source', pt.size=0.1, 
+        split.by='Source') + ggtitle('UMAP split by dataset source'); plot(p)
+#   by cluster (unlabeled)
+p <- DimPlot(data.all$proc, reduction='umap', label=T, pt.size=0.1) + 
+  ggtitle('UMAP of combined scRNA-seq data (unlabeled)'); plot(p)
+if (save.plots) { 
+  ggsave('plots/UMAP_unlabeled.pdf', width=10, height=5, units='in')
+}
+
+#   by cluster (labeled)
+lab <- c('Tumor cell', 'Technical error 1', 'Cytotoxic CD8 T cell 1', 'B cell', 
+         'Melanocytes 1', 'Macrophage', 'Cytotoxic CD8 T cell 2', 'Technical error 2', 
+         'Memory T cell', 'Melanocytes 2', 'Dysfunctional CD8 T cell', 
+         'Cytotoxic CD8 T cell 3', '? 1', 'Melanocytes 3', 'Activated cell', 
+         'Exhausted T cell', 'Cytotoxic T cell', '? 2', '? 3', 'Melanocytes 4', '? 4')
+names(lab) <- levels(data.all$proc)
+plot.data <- data.all$proc %>% RenameIdents(., lab)
+p <- DimPlot(plot.data, reduction='umap', label=T, pt.size=0.1) + 
+  ggtitle('UMAP of combined scRNA-seq data (labeled)'); plot(p)
+if (save.plots) { 
+  ggsave('plots/UMAP_labeled.pdf', width=10, height=5, units='in')
+}
+
+```
+
+### Biomarkers
+
+```{r biomarkers, warning=F, message=T}
+
+# Find all biomarkers based on clustering (runtime: ~30 minutes)
+if (!('bm' %in% names(data.all))) { 
+  data.all$bm <- FindAllMarkers(data.all$proc, min.pct=0.25, logfc.threshold=0.25)
+}
+
+# View table of top 3 biomarkers for each cluster
+d <- data.all$bm %>% group_by(cluster) %>% slice_max(n=3, order_by=avg_log2FC)
+datatable(d)
+
+# Visualize ridge plots based on biomarkers of interest
+ridge.feat <- dlg_list(sort(unique(d$gene)), multiple=T)$res
+p <- RidgePlot(data.all$proc, features=ridge.feat, 
+          ncol=ceiling(length(ridge.feat) / 2)); plot(p)
+if (save.plots) { 
+  ggsave('plots/biomarker_ridge_plots.pdf', width=10, height=10, units='in')
+}
+
+```
+
+## 3. Comparisons: disease vs. control
+
+**Description**: determine differentially expressed genes (DEGs) between disease vs. control groups.
+
+### Case: tumor
+
+```{r DE_tumor, warning=F, message=T}
+
+# Instantiate DE variable
+if (!exists('de')) { 
+  de <- list()
+}
+if (!('data' %in% names(de))) { 
+  de$data <- GetAssayData(object=data.all$proc, slot='data')
+}
+
+# Define datasets to compare
+ix <- intersect(rownames(obj$dataset3), rownames(obj$dataset2)) %>%
+  intersect(., rownames(obj$dataset4))
+jx1 <- data.all$proc$Source == names(obj)[3] | data.all$proc$Malignant %in% 'Yes'
+jx2 <- data.all$proc$Source == names(obj)[4]
+x <- de$data[ix, jx1]; y <- de$data[ix, jx2]
+
+# DE analysis (runtime: ~15 minutes)
+if (!('tumor' %in% names(de))) { 
+  de$tumor <- de_analyze(x, y) %>% na.omit
+}
+
+# Visualize dot plot
+dot.feat <- dlg_list(de$tumor$gene[de$tumor$q.val < 0.05], multiple=T)$res
+p.data <- data.all$proc 
+Idents(p.data) <- as.factor(case_when(jx1 ~ 'Disease', jx2 ~ 'Control', T ~ 'NA'))
+p <- p.data %>% 
+  DotPlot(object=., features=dot.feat, idents=c('Disease', 'Control')) + 
+  ggtitle('Case: tumor')
+plot(p)
+if (save.plots) { 
+  ggsave('plots/DE_tumor.pdf', width=10, height=5, units='in')
+}
+
+```
+
+### Case: immune cells (bulk)
+
+```{r DE_immune_bulk,warning=F, message=T}
+
+# Define datasets to compare
+ix <- intersect(rownames(obj$dataset1), rownames(obj$dataset2)) %>% 
+  intersect(., rownames(obj$dataset5))
+jx1 <- data.all$proc$Source == names(obj)[1] | data.all$proc$Malignant %in% 'No'
+jx2 <- data.all$proc$Source == names(obj)[5]
+x <- de$data[ix, jx1]; y <- de$data[ix, jx2]
+
+# DE analysis (runtime: ~20 minutes)
+if (!('immune' %in% names(de))) { 
+  de$immune <- de_analyze(x, y) %>% na.omit()
+}
+
+# Visualize dot plot
+dot.feat <- dlg_list(de$immune$gene[de$immune$q.val < 0.05], multiple=T)$res
+p.data <- data.all$proc 
+Idents(p.data) <- as.factor(case_when(jx1 ~ 'Disease', jx2 ~ 'Control', T ~ 'NA'))
+p <- p.data %>% 
+  DotPlot(object=., features=dot.feat, idents=c('Disease', 'Control')) + 
+  ggtitle('Case: immune cells')
+plot(p)
+if (save.plots) { 
+  ggsave('plots/DE_immune_bulk.pdf', width=10, height=5, units='in')
+}
+
+```
+
+### Case: immune cells (cluster-based)
+
+```{r DE_immune_cluster, warning=F, message=T}
+
+# Define datasets to compare (runtime: ~5 minutes)
+immune.cells <- c('B', 'CD8', 'Macrophage', 'Memory', 'Activated')
+for (i in 1:length(immune.cells)) { 
+  # Define row + column indices
+  ix <- intersect(rownames(obj$dataset1), rownames(obj$dataset2)) %>% 
+    intersect(., rownames(obj$dataset5))
+  c <- grepl(immune.cells[i], Idents(plot.data))
+  jx1 <- (plot.data$Source == names(obj)[1] | 
+            data.all$proc$Malignant %in% 'No') & c
+  jx2 <- data.all$proc$Source == names(obj)[5] & c
+  x <- de$data[ix, jx1]; y <- de$data[ix, jx2]
+  # DE analysis
+  if (!(immune.cells[i] %in% names(de))) { 
+    de[[immune.cells[i]]] <- de_analyze(x, y) %>% na.omit()
+  }
+  # Visualize dot plot
+  x <- de[[immune.cells[[i]]]]
+  dot.feat <- x$gene[x$q.val < 0.05][1:5]
+  p.data <- data.all$proc 
+  Idents(p.data) <- as.factor(case_when(jx1 ~ 'Disease', jx2 ~ 'Control', T ~ 'NA'))
+  p <- p.data %>% 
+    DotPlot(object=., features=dot.feat, idents=c('Disease', 'Control')) + 
+    ggtitle(paste0('Case: ', immune.cells[i]))
+  plot(p)
+  if (save.plots) { 
+    ggsave(paste0('plots/DE_', immune.cells[i], '.pdf'), 
+           width=10, height=5, units='in')
+  }
+}
+
+```
+
+# Case: responder vs. non-responder
+ix <- rownames(obj$dataset1)
+jx1 <- data.all$proc$Response %in% 'Responder'
+jx2 <- data.all$proc$Response %in% 'Non-responder'
+
+# Save outputs and working space (if prompted)
+
+```
