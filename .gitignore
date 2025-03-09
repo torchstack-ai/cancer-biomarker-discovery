@@ -12,6 +12,7 @@ README.txt
 *.pdf
 renv/*
 .DS_Store
+*.png
 
 # Ignore all debugging and temporary files 
 logs/*

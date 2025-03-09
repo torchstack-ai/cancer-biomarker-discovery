@@ -517,3 +517,232 @@ jx2 <- data.all$proc$Response %in% 'Non-responder'
 # Save outputs and working space (if prompted)
 
 ```
+
+```{r glycolysis_visualization, warning=F, message=T}
+# Define key glycolytic genes
+glycolysis_genes <- c(
+  "HK1", "HK2", "GPI", "PFKL", "PFKM", "PFKP",  # Glucose uptake and early glycolysis
+  "ALDOA", "ALDOB", "ALDOC",                     # Aldolase isoforms
+  "TPI1",                                        # Triose phosphate isomerase
+  "GAPDH",                                       # Glyceraldehyde phosphate dehydrogenase
+  "PGK1",                                        # Phosphoglycerate kinase
+  "PGAM1",                                       # Phosphoglycerate mutase
+  "ENO1", "ENO2",                               # Enolase isoforms
+  "PKM", "PKLR",                                # Pyruvate kinase isoforms
+  "LDHA", "LDHB",                               # Lactate dehydrogenase
+  "SLC2A1", "SLC2A3"                            # Glucose transporters (GLUT1, GLUT3)
+)
+
+# Filter for genes present in the dataset
+glycolysis_genes_present <- intersect(glycolysis_genes, rownames(de$data))
+
+# Create anonymous gene IDs
+anon_genes <- paste0("gene_", seq_along(glycolysis_genes_present))
+names(anon_genes) <- glycolysis_genes_present
+
+# Create mapping dataframe for reference
+gene_mapping <- data.frame(
+  Original_Gene = glycolysis_genes_present,
+  Anonymous_ID = anon_genes[glycolysis_genes_present]
+)
+
+# Write mapping to file if saving is enabled
+if (save.plots) {
+  write.csv(gene_mapping, 'results/glycolysis_gene_mapping.csv', row.names = FALSE)
+}
+
+# Create dot plot for glycolytic genes
+p.data <- data.all$proc
+Idents(p.data) <- as.factor(case_when(jx1 ~ 'Disease', jx2 ~ 'Control', T ~ 'NA'))
+
+# Generate dot plot with anonymous IDs and custom colors
+p_glycolysis <- DotPlot(p.data, 
+                        features = glycolysis_genes_present,
+                        idents = c('Disease', 'Control')) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  xlab('Genes') +
+  ylab('Condition') +
+  scale_color_gradient2(low = "navy", mid = "gray90", high = "red", 
+                       midpoint = 0, name = "Average\nExpression") +
+  scale_x_discrete(labels = anon_genes[glycolysis_genes_present])
+
+# Display plot
+print(p_glycolysis)
+
+# Save plot if requested
+if (save.plots) {
+  ggsave('plots/DE_tumor_glycolysis.pdf', 
+         plot = p_glycolysis, 
+         width = 12, 
+         height = 6, 
+         units = 'in')
+}
+
+# Calculate statistics for glycolytic genes
+glycolysis_stats <- de$tumor[de$tumor$gene %in% glycolysis_genes_present, ]
+glycolysis_stats <- glycolysis_stats[order(glycolysis_stats$q.val), ]
+
+# Add anonymous IDs to statistics
+glycolysis_stats$anonymous_id <- anon_genes[glycolysis_stats$gene]
+
+# Display statistics with anonymous IDs
+print("Differential Expression Statistics for De-identified Glycolytic Genes:")
+glycolysis_stats$gene <- glycolysis_stats$anonymous_id
+print(glycolysis_stats)
+
+# Count significantly different genes
+sig_glyco_genes <- sum(glycolysis_stats$q.val < 0.05)
+print(sprintf("Number of significantly different glycolytic genes (q < 0.05): %d", sig_glyco_genes))
+```
+
+```{r glycolysis_boxplots, warning=F, message=T}
+# Get expression data for glycolytic genes
+expr_data <- GetAssayData(p.data, slot = "data")[glycolysis_genes_present,]
+
+# Filter out genes with all zeros
+nonzero_genes <- rownames(expr_data)[rowSums(expr_data > 0) > 0]
+expr_data <- expr_data[nonzero_genes,]
+
+# Update anonymous gene IDs for non-zero genes
+anon_genes <- anon_genes[nonzero_genes]
+
+target_genes <- c("g10", "g21", "g03")
+selected_genes <- names(anon_genes)[anon_genes %in% target_genes]
+
+# Create a data frame for plotting and store statistical results
+plot_data <- data.frame()
+stat_results <- data.frame(
+  Gene = character(),
+  P_value = numeric(),
+  T_statistic = numeric(),
+  Mean_diff = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (gene in selected_genes) {
+  # Get expression values for current gene
+  expr_values <- expr_data[gene,]
+  
+  # Split values by condition before centering
+  disease_vals <- expr_values[colnames(expr_data) %in% colnames(de$data)[jx1]]
+  control_vals <- expr_values[colnames(expr_data) %in% colnames(de$data)[jx2]]
+  
+  # Perform t-test on raw values
+  t_test_result <- t.test(disease_vals, control_vals)
+  
+  # Center the expression values by subtracting the overall mean
+  overall_mean <- mean(expr_values)
+  disease_vals_centered <- disease_vals - overall_mean
+  control_vals_centered <- control_vals - overall_mean
+  
+  # Store statistical results
+  stat_results <- rbind(stat_results, data.frame(
+    Gene = anon_genes[gene],
+    P_value = t_test_result$p.value,
+    T_statistic = t_test_result$statistic,
+    Mean_diff = mean(disease_vals) - mean(control_vals),
+    Mean_centered_diff = mean(disease_vals_centered) - mean(control_vals_centered),
+    stringsAsFactors = FALSE
+  ))
+  
+  # Create temporary data frames for each condition with centered values
+  temp_df <- data.frame(
+    Expression = c(disease_vals_centered, control_vals_centered),
+    Gene = anon_genes[gene],
+    Condition = c(rep("Disease", length(disease_vals_centered)), 
+                 rep("Control", length(control_vals_centered)))
+  )
+  
+  # Append to main data frame
+  plot_data <- rbind(plot_data, temp_df)
+}
+
+# Add FDR correction
+stat_results$FDR <- p.adjust(stat_results$P_value, method = "BH")
+
+# Sort results by p-value
+stat_results <- stat_results[order(stat_results$P_value), ]
+
+# Create boxplot with swarm plot
+p_boxplot <- ggplot(plot_data, aes(x = Gene, y = Expression, fill = Condition)) +
+  # Add swarm plot layer first (so it appears behind)
+  geom_jitter(aes(color = Condition), position = position_jitterdodge(jitter.width = 0.2), 
+              size = 0.3, alpha = 0.3) +
+  # Add boxplot layer second (so it appears in front)
+  geom_boxplot(outlier.shape = NA, alpha = 0.4, width = 0.7) +
+  # Colors for boxplot fill and point colors
+  scale_fill_manual(values = c("Disease" = "#E41A1C", "Control" = "#377EB8")) +
+  scale_color_manual(values = c("Disease" = "#E41A1C", "Control" = "#377EB8")) +
+  # Set y-axis limits
+  ylim(-2, max(plot_data$Expression)) +
+  # Theme customization
+  theme_minimal() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.y = element_blank(),  # Remove y-axis major grid lines
+    panel.grid.minor.y = element_blank(),  # Remove y-axis minor grid lines
+    panel.grid.major.x = element_line(color = "gray90"),  # Keep x-axis major grid lines
+    panel.grid.minor.x = element_blank(),  # Remove x-axis minor grid lines
+    legend.position = c(0.95, 0.95),  # Position legend inside top-right
+    legend.justification = c(1, 1),    # Anchor point for legend
+    legend.box.just = "right",
+    legend.margin = margin(6, 6, 6, 6),
+    legend.background = element_rect(fill = "white", color = NA),
+    legend.box.background = element_rect(color = "gray90")
+  ) +
+  # Labels
+  xlab("Genes") +
+  ylab("Centered Expression") +
+  ggtitle("Gene Expression Relative to Mean") +
+  # Add horizontal line at y=0
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray50", alpha = 0.5)
+
+# Display plot
+print(p_boxplot)
+
+# Save plot if requested
+if (save.plots) {
+  ggsave('plots/DE_tumor_glycolysis_boxplots.pdf', 
+         plot = p_boxplot, 
+         width = 12, 
+         height = 6, 
+         units = 'in')
+}
+
+# Calculate summary statistics for centered data
+summary_stats <- plot_data %>%
+  group_by(Gene, Condition) %>%
+  summarise(
+    Mean = mean(Expression),
+    Median = median(Expression),
+    SD = sd(Expression),
+    Q1 = quantile(Expression, 0.25),
+    Q3 = quantile(Expression, 0.75),
+    n = n(),
+    .groups = 'drop'
+  )
+
+# Display summary statistics
+print("Summary Statistics for Centered Expression by Condition:")
+print(summary_stats)
+
+# Display statistical test results
+print("\nStatistical Test Results (Disease vs Control):")
+print(stat_results)
+
+# Print number of genes removed due to zero expression
+n_removed <- length(glycolysis_genes_present) - length(nonzero_genes)
+if (n_removed > 0) {
+  print(sprintf("\nRemoved %d genes with zero expression", n_removed))
+  print("Removed genes:")
+  print(setdiff(glycolysis_genes_present, nonzero_genes))
+}
+
+# Print number of significantly different genes
+sig_genes <- sum(stat_results$FDR < 0.05)
+if (sig_genes > 0) {
+  print(sprintf("\nNumber of significantly different genes (FDR < 0.05): %d", sig_genes))
+  print("Significant genes:")
+  print(stat_results[stat_results$FDR < 0.05, ])
+}
+```

@@ -27,6 +27,17 @@ Of note, pre-processed data stored in the `scRNAseq_analysis.RData` file is used
 # Initialize environment
 
 ```{r load_packages, results="hide", message=F, warning=F, error=F}
+# Install required packages if not already installed
+if (!require("BiocManager", quietly = TRUE)) {
+  install.packages("BiocManager")
+}
+if (!require("MAST", quietly = TRUE)) {
+  BiocManager::install("MAST")
+}
+if (!require("presto", quietly = TRUE)) {
+  install.packages("presto")
+}
+
 # Memory management settings
 options(future.globals.maxSize = 16000 * 1024^2)  # Set maximum global size to 8GB
 
